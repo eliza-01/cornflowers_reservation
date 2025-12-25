@@ -1,0 +1,122 @@
+<!doctype html>
+<html lang="ru">
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1, maximum-scale=1, user-scalable=no"/>
+  <title>Бронирование столов — Админ</title>
+  <link rel="stylesheet" href="./style.css" />
+</head>
+<body>
+  <div class="app">
+    <header class="topbar">
+      <div class="title" id="screenTitle">Шаг 1 — Выбор даты</div>
+      <div class="subtitle" id="screenSubtitle"></div>
+    </header>
+
+    <!-- Шаг 1: календарь -->
+    <section class="screen" id="screen1">
+      <div class="calendar">
+        <div class="calendar-head">
+          <button class="icon-btn" id="prevMonthBtn" aria-label="Предыдущий месяц">‹</button>
+          <div class="calendar-month" id="monthLabel">—</div>
+          <button class="icon-btn" id="nextMonthBtn" aria-label="Следующий месяц">›</button>
+        </div>
+        <div class="calendar-weekdays">
+          <div>Пн</div><div>Вт</div><div>Ср</div><div>Чт</div><div>Пт</div><div>Сб</div><div>Вс</div>
+        </div>
+        <div class="calendar-grid" id="calendarGrid"></div>
+        <div class="hint">Прошлые даты выбирать нельзя.</div>
+      </div>
+    </section>
+
+    <!-- Шаг 2: выбор стола -->
+    <section class="screen hidden" id="screen2">
+      <div class="tables">
+        <div class="hint">
+          Брони:
+          0–1 = зелёный, 2–3 = жёлтый, 4+ = красный
+        </div>
+
+        <div class="row-label">1–10</div>
+        <div class="table-row" id="tablesRow1"></div>
+
+        <div class="row-label">11–20</div>
+        <div class="table-row" id="tablesRow2"></div>
+
+        <div class="row-label">21–27</div>
+        <div class="table-row" id="tablesRow3"></div>
+      </div>
+
+      <div class="footer-actions">
+        <button class="btn secondary" id="backToDateBtn">← Назад</button>
+      </div>
+    </section>
+
+    <!-- Шаг 3: список броней -->
+    <section class="screen hidden" id="screen3">
+      <div class="bookings">
+        <div class="section-title">Существующие брони</div>
+        <div class="list" id="bookingList"></div>
+        <div class="hint" id="emptyHint">Пока нет броней на эту дату.</div>
+      </div>
+
+      <div class="footer-actions">
+        <button class="btn secondary" id="backToTablesBtn">← Назад</button>
+        <button class="btn primary" id="openCreateBtn">Забронировать</button>
+      </div>
+    </section>
+
+    <!-- Шаг 4: создание/редактирование -->
+    <section class="screen hidden" id="screen4">
+      <form class="form" id="createForm">
+        <label class="field">
+          <div class="label">Время (09:00–21:00)</div>
+          <select id="timeSelect" required></select>
+        </label>
+
+        <label class="field">
+          <div class="label">Имя</div>
+          <input id="nameInput" type="text" maxlength="120" required />
+        </label>
+
+        <label class="field">
+          <div class="label">Телефон</div>
+          <input id="phoneInput" type="tel" inputmode="numeric" autocomplete="tel" required />
+        </label>
+
+        <label class="field">
+          <div class="label">Кол-во чел.</div>
+          <input id="peopleInput" type="number" min="1" max="99" required />
+        </label>
+
+        <label class="field">
+          <div class="label">Комментарий</div>
+          <textarea id="commentInput" rows="3" maxlength="2000"></textarea>
+        </label>
+
+        <div class="footer-actions">
+          <button class="btn secondary" type="button" id="cancelCreateBtn">← Отмена</button>
+          <button class="btn primary" type="submit" id="confirmCreateBtn">Подтвердить</button>
+        </div>
+      </form>
+    </section>
+  </div>
+
+  <!-- Модалка просмотра брони -->
+  <div class="modal hidden" id="modal">
+    <div class="modal-backdrop" id="modalBackdrop"></div>
+    <div class="modal-card">
+      <div class="modal-title">Детали брони</div>
+      <div class="kv" id="modalKv"></div>
+      <div class="modal-actions modal-actions-3">
+        <button class="btn secondary" id="closeModalBtn">Закрыть</button>
+        <button class="btn primary" id="editModalBtn">Редактировать</button>
+        <button class="btn danger" id="deleteModalBtn">Удалить</button>
+      </div>
+    </div>
+  </div>
+
+  <script src="https://telegram.org/js/telegram-web-app.js"></script>
+  <script src="./app.js"></script>
+</body>
+</html>

@@ -1,6 +1,11 @@
 (() => {
   const tg = window.Telegram && window.Telegram.WebApp ? window.Telegram.WebApp : null;
 
+  // ВАЖНО: API относительно текущего адреса страницы
+  // Если страница: https://swyp.ru/other/cornflowers_reservation/public/
+  // то API будет:     https://swyp.ru/other/cornflowers_reservation/api/
+  const API_BASE = new URL('../api/', window.location.href);
+
   // --- UI refs
   const screenTitle = document.getElementById('screenTitle');
   const screenSubtitle = document.getElementById('screenSubtitle');
@@ -28,6 +33,7 @@
   const createForm = document.getElementById('createForm');
   const timeSelect = document.getElementById('timeSelect');
   const nameInput = document.getElementById('nameInput');
+  const phoneInput = document.getElementById('phoneInput');
   const peopleInput = document.getElementById('peopleInput');
   const commentInput = document.getElementById('commentInput');
   const cancelCreateBtn = document.getElementById('cancelCreateBtn');
@@ -77,45 +83,122 @@
     screenSubtitle.textContent = subtitle || '';
   }
 
-  async function api(path, payload){
+  async function api(endpointFile, payload){
     const initData = tg ? (tg.initData || '') : '';
-    const res = await fetch(path, {
+    const url = new URL(endpointFile, API_BASE).toString();
+
+    const res = await fetch(url, {
       method: 'POST',
       headers: { 'Content-Type':'application/json' },
       body: JSON.stringify({ initData, ...payload })
     });
-    const data = await res.json().catch(() => null);
+
+    const text = await res.text();
+    let data = null;
+    try { data = JSON.parse(text); } catch (_) {}
+
     if (!data || !data.ok){
-      const msg = (data && data.error) ? data.error : `Ошибка API: ${res.status}`;
+      const serverMsg = data && data.error ? data.error : null;
+      const raw = text ? text.slice(0, 300) : '';
+      const msg = serverMsg || `Ошибка API: ${res.status}${raw ? `: ${raw}` : ''}`;
       throw new Error(msg);
     }
+
     return data;
   }
 
-  function toast(msg){
-    if (tg && tg.showPopup){
-      tg.showPopup({ title: 'Сообщение', message: msg, buttons: [{type:'ok'}] });
-      return;
+  // ---- Telegram capability helpers (ВАЖНО: telegram-web-app.js создает tg и в браузере)
+  function parseVersionStr(v){
+    const s = String(v || '');
+    const m = s.match(/^(\d+)(?:\.(\d+))?/);
+    if (!m) return [0,0];
+    const major = parseInt(m[1], 10) || 0;
+    const minor = parseInt(m[2] || '0', 10) || 0;
+    return [major, minor];
+  }
+
+  function tgVersionAtLeast(minStr){
+    const [needMajor, needMinor] = parseVersionStr(minStr);
+    const [curMajor, curMinor] = parseVersionStr(tg && tg.version ? tg.version : '');
+    if (curMajor !== needMajor) return curMajor > needMajor;
+    return curMinor >= needMinor;
+  }
+
+  function isRealTelegramEnv(){
+    // В обычном браузере tg обычно есть, но initData пустой.
+    try{
+      return !!(tg && typeof tg.initData === 'string' && tg.initData.length > 0);
+    }catch(_){
+      return false;
     }
-    alert(msg);
+  }
+
+  function canUseNativePopups(){
+    // showPopup/showAlert/showConfirm доступны с 6.2+
+    return isRealTelegramEnv() && tgVersionAtLeast('6.2');
+  }
+
+  function toast(msg){
+    const text = String(msg || '');
+
+    if (tg && canUseNativePopups()){
+      try{
+        if (typeof tg.showAlert === 'function'){
+          tg.showAlert(text);
+          return;
+        }
+        if (typeof tg.showPopup === 'function'){
+          tg.showPopup({ title: 'Сообщение', message: text, buttons: [{type:'ok'}] });
+          return;
+        }
+      }catch(_){
+        // fallthrough -> alert
+      }
+    }
+
+    alert(text);
   }
 
   async function confirmBox(msg){
-    if (tg && tg.showPopup){
-      return await new Promise((resolve) => {
-        tg.showPopup({
-          title: 'Подтвердите',
-          message: msg,
-          buttons: [
-            { id: 'yes', type: 'default', text: 'Да' },
-            { id: 'no', type: 'destructive', text: 'Нет' }
-          ]
-        }, (buttonId) => {
-          resolve(buttonId === 'yes');
-        });
-      });
+    const text = String(msg || '');
+
+    if (tg && canUseNativePopups()){
+      // Пытаемся нативно, но НИКОГДА не даем промису упасть наружу
+      try{
+        if (typeof tg.showPopup === 'function'){
+          return await new Promise((resolve) => {
+            try{
+              tg.showPopup({
+                title: 'Подтвердите',
+                message: text,
+                buttons: [
+                  { id: 'yes', type: 'default', text: 'Да' },
+                  { id: 'no', type: 'destructive', text: 'Нет' }
+                ]
+              }, (buttonId) => {
+                resolve(buttonId === 'yes');
+              });
+            }catch(_){
+              resolve(confirm(text));
+            }
+          });
+        }
+
+        if (typeof tg.showConfirm === 'function'){
+          return await new Promise((resolve) => {
+            try{
+              tg.showConfirm(text, (ok) => resolve(!!ok));
+            }catch(_){
+              resolve(confirm(text));
+            }
+          });
+        }
+      }catch(_){
+        // fallthrough -> confirm
+      }
     }
-    return confirm(msg);
+
+    return confirm(text);
   }
 
   function todayISO(){
@@ -124,11 +207,36 @@
   }
 
   function statusClassByCount(cnt){
-    // Требование: зелёный если броней нет. Желтый если 2-3. Красный 4-5.
-    // Для 1 брони оставляем "зелёный" (таблица почти свободна). Для 6+ тоже красный.
+    // зелёный если броней нет. жёлтый 2-3. красный 4-5 (и выше тоже красный).
+    // 1 бронь оставляем зелёной.
     if (cnt >= 4) return 'status-red';
     if (cnt >= 2) return 'status-yellow';
     return 'status-green';
+  }
+
+  function digitsOnly(s){
+    return String(s || '').replace(/\D/g, '');
+  }
+
+  function normalizePhoneInput(){
+    const v = digitsOnly(phoneInput.value);
+    if (phoneInput.value !== v) phoneInput.value = v;
+  }
+
+  // формат: 8 (029) 111-11-11  (11 цифр: 80291111111)
+  function formatPhoneForView(raw){
+    const d = digitsOnly(raw);
+
+    // 8 + (029) + 111 + 11 + 11 => 11 цифр
+    if (d.length === 11 && d[0] === '8'){
+      const a = d.slice(1, 4);   // 029
+      const b = d.slice(4, 7);   // 111
+      const c = d.slice(7, 9);   // 11
+      const e = d.slice(9, 11);  // 11
+      return `8 (${a}) ${b}-${c}-${e}`;
+    }
+
+    return d || '—';
   }
 
   // --- calendar render
@@ -195,7 +303,7 @@
     for (let i=1;i<=27;i++) tableCounts[String(i)] = 0;
 
     try{
-      const data = await api('/api/get_day_summary.php', { date: selectedDate });
+      const data = await api('get_day_summary.php', { date: selectedDate });
       tableCounts = data.counts || tableCounts;
     }catch(e){
       toast(e.message);
@@ -241,7 +349,7 @@
     emptyHint.classList.add('hidden');
 
     try{
-      const data = await api('/api/get_bookings.php', { date: selectedDate, table_id: selectedTableId });
+      const data = await api('get_bookings.php', { date: selectedDate, table_id: selectedTableId });
       bookingsCache = data.bookings || [];
     }catch(e){
       toast(e.message);
@@ -261,14 +369,19 @@
 
         const main = document.createElement('div');
         main.className = 'main';
-        main.textContent = `${b.booking_time} / ${b.customer_name} / ${b.people_count}`;
+        main.textContent = `${b.booking_time} / ${b.customer_name} / ${b.people_count} чел.`;
 
-        const sub = document.createElement('div');
-        sub.className = 'sub';
-        sub.textContent = (b.comment && b.comment.trim()) ? b.comment.trim() : 'Без комментария';
+        const phoneLine = document.createElement('div');
+        phoneLine.className = 'sub phone';
+        phoneLine.textContent = formatPhoneForView(b.customer_phone);
+
+        const commentLine = document.createElement('div');
+        commentLine.className = 'sub comment';
+        commentLine.textContent = (b.comment && String(b.comment).trim()) ? String(b.comment).trim() : 'Без комментария';
 
         left.appendChild(main);
-        left.appendChild(sub);
+        left.appendChild(phoneLine);
+        left.appendChild(commentLine);
 
         const arrow = document.createElement('div');
         arrow.className = 'sub';
@@ -292,7 +405,7 @@
 
   async function openBookingModal(id){
     try{
-      const data = await api('/api/get_booking.php', { id });
+      const data = await api('get_booking.php', { id });
       const b = data.booking;
       currentModalBooking = b;
 
@@ -302,8 +415,9 @@
         ['Дата', String(b.booking_date)],
         ['Время', String(b.booking_time)],
         ['Имя', String(b.customer_name)],
-        ['Людей', String(b.people_count)],
-        ['Комментарий', (b.comment && b.comment.trim()) ? b.comment.trim() : '—'],
+        ['Телефон', formatPhoneForView(b.customer_phone)],
+        ['Кол-во чел.', String(b.people_count)],
+        ['Комментарий', (b.comment && String(b.comment).trim()) ? String(b.comment).trim() : '—'],
       ];
 
       for (const [k,v] of pairs){
@@ -367,28 +481,40 @@
   async function submitBooking(){
     const time = timeSelect.value;
     const name = nameInput.value.trim();
+    normalizePhoneInput();
+    const phone = phoneInput.value.trim();
     const people = parseInt(peopleInput.value, 10) || 0;
     const comment = commentInput.value.trim();
 
     if (!time){ toast('Выберите время'); return; }
     if (!name){ toast('Введите имя'); return; }
+    if (!phone){ toast('Введите телефон'); return; }
+
+    // 11 цифр, начинается с 80 (пример: 8 (029) 111-11-11 => 80291111111)
+    if (!/^\d{11}$/.test(phone) || phone[0] !== '8' || phone[1] !== '0'){
+      toast('Телефон: 11 цифр, начинается с 80 (пример: 8 (029) 111-11-11)');
+      return;
+    }
+
     if (people < 1){ toast('Укажите кол-во человек'); return; }
 
     try{
       if (editingBookingId){
-        await api('/api/update_booking.php', {
+        await api('update_booking.php', {
           id: editingBookingId,
           time,
           name,
+          phone,
           people,
           comment
         });
       } else {
-        await api('/api/create_booking.php', {
+        await api('create_booking.php', {
           date: selectedDate,
           table_id: selectedTableId,
           time,
           name,
+          phone,
           people,
           comment
         });
@@ -403,6 +529,7 @@
 
       // чистим форму
       nameInput.value = '';
+      phoneInput.value = '';
       peopleInput.value = '';
       commentInput.value = '';
 
@@ -446,6 +573,7 @@
 
     renderTimeSelect(null);
     nameInput.value = '';
+    phoneInput.value = '';
     peopleInput.value = '';
     commentInput.value = '';
     nameInput.focus();
@@ -482,6 +610,8 @@
     // текущие брони уже в bookingsCache (для выбранного стола/даты)
     renderTimeSelect(String(b.booking_time));
     nameInput.value = String(b.customer_name || '');
+    phoneInput.value = (b.customer_phone && String(b.customer_phone)) ? String(b.customer_phone) : '';
+    normalizePhoneInput();
     peopleInput.value = String(b.people_count || '');
     commentInput.value = (b.comment && String(b.comment)) ? String(b.comment) : '';
     nameInput.focus();
@@ -497,7 +627,7 @@
     if (!ok) return;
 
     try{
-      await api('/api/delete_booking.php', { id: parseInt(b.id, 10) });
+      await api('delete_booking.php', { id: parseInt(b.id, 10) });
       closeModal();
       await loadBookingsAndRender();
     }catch(e){
@@ -507,7 +637,7 @@
 
   // --- init
   function init(){
-    // iPhone/iOS: добавляем класс на body
+    // iPhone/iOS: добавляем класс на body (для padding-top: 80px)
     const ua = navigator.userAgent || '';
     const isIOS = /iPhone|iPad|iPod/i.test(ua) || (navigator.platform === 'MacIntel' && navigator.maxTouchPoints > 1);
     if (isIOS) document.body.classList.add('ios');
@@ -525,7 +655,15 @@
     showScreen(1);
 
     renderCalendar(visibleYear, visibleMonth);
+
+    // таблицы рисуем, но цвета появятся после выбора даты
     renderTables();
+
+    // телефон — жестко только цифры
+    if (phoneInput){
+      phoneInput.addEventListener('input', normalizePhoneInput);
+      phoneInput.addEventListener('blur', normalizePhoneInput);
+    }
   }
 
   init();

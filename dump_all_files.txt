@@ -1,0 +1,1778 @@
+api\auth.php
+<?php
+declare(strict_types=1);
+
+require_once __DIR__ . '/config.php';
+require_once __DIR__ . '/db.php';
+
+/**
+ * Проверка Telegram WebApp initData.
+ */
+function tg_validate_init_data(string $initData): array {
+  parse_str($initData, $params);
+
+  if (!isset($params['hash'])) {
+    return ['ok' => false, 'error' => 'initData has no hash'];
+  }
+  $hash = (string)$params['hash'];
+  unset($params['hash']);
+
+  // Проверка возраста
+  if (isset($params['auth_date'])) {
+    $authDate = (int)$params['auth_date'];
+    if ($authDate > 0 && (time() - $authDate) > MAX_INITDATA_AGE_SECONDS) {
+      return ['ok' => false, 'error' => 'initData expired'];
+    }
+  }
+
+  ksort($params);
+  $pairs = [];
+  foreach ($params as $k => $v) {
+    $pairs[] = $k . '=' . $v;
+  }
+  $dataCheckString = implode("\n", $pairs);
+
+  $secretKey = hash_hmac('sha256', BOT_TOKEN, 'WebAppData', true);
+  $calculatedHash = hash_hmac('sha256', $dataCheckString, $secretKey);
+
+  if (!hash_equals($calculatedHash, $hash)) {
+    return ['ok' => false, 'error' => 'initData hash mismatch'];
+  }
+
+  $user = null;
+  if (isset($params['user'])) {
+    $user = json_decode((string)$params['user'], true);
+  }
+
+  return ['ok' => true, 'user' => $user, 'params' => $params];
+}
+
+/**
+ * Защита API:
+ * - Если initData пустой:
+ *   - ALLOW_BROWSER=true => пропускаем (браузерный режим)
+ *   - иначе 401
+ * - Если initData есть — проверяем Telegram и (если надо) список админов.
+ */
+function require_admin_from_body(array $body): array {
+  $initData = (string)($body['initData'] ?? '');
+
+  // Открыли не внутри Telegram Mini App
+  if ($initData === '') {
+    if (!ALLOW_BROWSER) {
+      json_out(['ok' => false, 'error' => 'initData required'], 401);
+    }
+    return ['user_id' => 0, 'user' => ['id' => 0, 'username' => 'browser']];
+  }
+
+  $res = tg_validate_init_data($initData);
+  if (!$res['ok']) json_out(['ok' => false, 'error' => $res['error']], 401);
+
+  $user = $res['user'];
+  $uid = is_array($user) && isset($user['id']) ? (int)$user['id'] : 0;
+  if ($uid <= 0) json_out(['ok' => false, 'error' => 'No user in initData'], 401);
+
+  if (!ALLOW_ALL_TG_USERS) {
+    if (!in_array($uid, ADMIN_USER_IDS, true)) {
+      json_out(['ok' => false, 'error' => 'Access denied'], 403);
+    }
+  }
+
+  return ['user_id' => $uid, 'user' => $user];
+}
+
+
+api\config.php
+<?php
+declare(strict_types=1);
+
+date_default_timezone_set('Europe/Berlin');
+
+/**
+ * Если true — разрешаем работу из обычного браузера (без Telegram initData).
+ * Если false — только внутри Telegram Mini App.
+ */
+const ALLOW_BROWSER = true;
+
+/**
+ * Режим доступа в Telegram:
+ * - true  => доступ всем пользователям Telegram
+ * - false => доступ только ADMIN_USER_IDS
+ */
+const ALLOW_ALL_TG_USERS = true;
+
+const BOT_TOKEN = '8530986456:AAFtaoQstnapV4yLygGIJ3kKjtyAFo6es-c';
+const ADMIN_USER_IDS = [528858271, 5069751888];
+
+// MySQL
+// ВАЖНО: чтобы порт работал, используем 127.0.0.1 (TCP), а не localhost (socket)
+const DB_HOST = '127.0.0.1';
+const DB_PORT = 3327;
+
+const DB_NAME = 'cornflowers_reservation';
+const DB_USER = 'cornflowers';
+const DB_PASS = '93125888qQ';
+const DB_CHARSET = 'utf8mb4';
+
+// Бронь только с 9 до 21 => последний слот 21:00, значит CLOSE_HOUR = 22
+const OPEN_HOUR = 9;
+const CLOSE_HOUR = 22;
+
+const MAX_INITDATA_AGE_SECONDS = 24 * 60 * 60;
+
+/**
+ * Telegram уведомления (в тему/тред).
+ */
+const TG_NOTIFY_ENABLED = true;
+const TG_NOTIFY_CHAT_ID = -1003548283340;
+const TG_NOTIFY_THREAD_ID = 3;
+
+
+api\create_booking.php
+<?php
+declare(strict_types=1);
+
+require_once __DIR__ . '/db.php';
+require_once __DIR__ . '/auth.php';
+require_once __DIR__ . '/config.php';
+require_once __DIR__ . '/telegram.php';
+
+$body = require_json_body();
+require_admin_from_body($body);
+
+$date = (string)($body['date'] ?? '');
+$tableId = (int)($body['table_id'] ?? 0);
+$time = (string)($body['time'] ?? ''); // "HH:MM"
+$name = trim((string)($body['name'] ?? ''));
+
+// телефон: принимаем и "8 (029) 111-11-11", и "80291111111" -> храним цифры
+$phoneRaw = (string)($body['phone'] ?? '');
+$phone = preg_replace('/\D+/', '', $phoneRaw);
+$phone = trim(is_string($phone) ? $phone : '');
+
+$people = (int)($body['people'] ?? 0);
+$comment = trim((string)($body['comment'] ?? ''));
+
+if (!preg_match('/^\d{4}-\d{2}-\d{2}$/', $date)) json_out(['ok' => false, 'error' => 'Invalid date'], 400);
+if ($tableId < 1 || $tableId > 27) json_out(['ok' => false, 'error' => 'Invalid table_id'], 400);
+if (!preg_match('/^\d{2}:\d{2}$/', $time)) json_out(['ok' => false, 'error' => 'Invalid time'], 400);
+if ($name === '') json_out(['ok' => false, 'error' => 'Name required'], 400);
+
+if ($phone === '') json_out(['ok' => false, 'error' => 'Phone required'], 400);
+// 11 цифр: 80XXXXXXXXX (пример: 80291111111 => 8 (029) 111-11-11)
+if (!preg_match('/^80\d{9}$/', $phone)) json_out(['ok' => false, 'error' => 'Invalid phone (example: 8 (029) 111-11-11)'], 400);
+
+if ($people < 1 || $people > 99) json_out(['ok' => false, 'error' => 'Invalid people_count'], 400);
+
+// Запрет прошлых дат (по Europe/Berlin)
+$today = (new DateTimeImmutable('now'))->format('Y-m-d');
+if ($date < $today) json_out(['ok' => false, 'error' => 'Past dates are not allowed'], 400);
+
+[$hh, $mm] = array_map('intval', explode(':', $time));
+if ($mm !== 0) json_out(['ok' => false, 'error' => 'Time must be on the hour'], 400);
+if ($hh < OPEN_HOUR || $hh >= CLOSE_HOUR) json_out(['ok' => false, 'error' => 'Time outside working hours'], 400);
+
+$timeSql = sprintf('%02d:00:00', $hh);
+
+try {
+  $stmt = db()->prepare(
+    'INSERT INTO bookings (table_id, booking_date, booking_time, customer_name, customer_phone, people_count, comment)
+     VALUES (:t, :d, :tm, :n, :ph, :p, :c)'
+  );
+  $stmt->execute([
+    ':t' => $tableId,
+    ':d' => $date,
+    ':tm' => $timeSql,
+    ':n' => $name,
+    ':ph' => $phone,
+    ':p' => $people,
+    ':c' => ($comment === '' ? null : $comment),
+  ]);
+} catch (PDOException $e) {
+  if (($e->getCode() ?? '') === '23000') {
+    json_out(['ok' => false, 'error' => 'This time is already booked'], 409);
+  }
+  json_out(['ok' => false, 'error' => 'DB error'], 500);
+}
+
+$id = (int)db()->lastInsertId();
+
+// уведомление в Telegram (не ломает API, если Telegram недоступен)
+tg_notify_booking('Новая бронь', [
+  'id' => $id,
+  'table_id' => $tableId,
+  'booking_date' => $date,
+  'booking_time' => $time,
+  'customer_name' => $name,
+  'customer_phone' => $phone,
+  'people_count' => $people,
+  'comment' => ($comment === '' ? null : $comment),
+]);
+
+json_out(['ok' => true, 'id' => $id]);
+
+
+api\db.php
+<?php
+declare(strict_types=1);
+
+require_once __DIR__ . '/config.php';
+
+ini_set('display_errors', ALLOW_BROWSER ? '1' : '0');
+ini_set('log_errors', '1');
+error_reporting(E_ALL);
+
+set_error_handler(function (int $severity, string $message, string $file, int $line) {
+  if (!(error_reporting() & $severity)) return false;
+  throw new ErrorException($message, 0, $severity, $file, $line);
+});
+
+set_exception_handler(function (Throwable $e) {
+  http_response_code(500);
+  header('Content-Type: application/json; charset=utf-8');
+
+  $msg = 'Server error';
+  $detail = null;
+
+  if (defined('ALLOW_BROWSER') && ALLOW_BROWSER) {
+    $msg = $e->getMessage();
+    $detail = ['file' => $e->getFile(), 'line' => $e->getLine()];
+  }
+
+  echo json_encode(['ok' => false, 'error' => $msg, 'detail' => $detail], JSON_UNESCAPED_UNICODE);
+  exit;
+});
+
+function db(): PDO {
+  static $pdo = null;
+  if ($pdo instanceof PDO) return $pdo;
+
+  $dsn = 'mysql:host=' . DB_HOST . ';port=' . DB_PORT . ';dbname=' . DB_NAME . ';charset=' . DB_CHARSET;
+
+  $pdo = new PDO($dsn, DB_USER, DB_PASS, [
+    PDO::ATTR_ERRMODE => PDO::ERRMODE_EXCEPTION,
+    PDO::ATTR_DEFAULT_FETCH_MODE => PDO::FETCH_ASSOC,
+    PDO::ATTR_EMULATE_PREPARES => false,
+  ]);
+
+  return $pdo;
+}
+
+function json_out(array $data, int $code = 200): void {
+  http_response_code($code);
+  header('Content-Type: application/json; charset=utf-8');
+  echo json_encode($data, JSON_UNESCAPED_UNICODE);
+  exit;
+}
+
+function require_json_body(): array {
+  $raw = file_get_contents('php://input');
+  $data = json_decode($raw ?: '', true);
+  if (!is_array($data)) {
+    json_out(['ok' => false, 'error' => 'Invalid JSON body'], 400);
+  }
+  return $data;
+}
+
+
+api\db_ping.php
+<?php
+declare(strict_types=1);
+
+require_once __DIR__ . '/db.php';
+
+$pdo = db();
+$ver = $pdo->query('SELECT VERSION() AS v')->fetch();
+json_out(['ok' => true, 'mysql_version' => $ver['v'] ?? null]);
+
+
+api\delete_booking.php
+<?php
+declare(strict_types=1);
+
+require_once __DIR__ . '/db.php';
+require_once __DIR__ . '/auth.php';
+require_once __DIR__ . '/telegram.php';
+
+$body = require_json_body();
+require_admin_from_body($body);
+
+$id = (int)($body['id'] ?? 0);
+if ($id <= 0) json_out(['ok' => false, 'error' => 'Invalid id'], 400);
+
+// сначала получаем данные (чтобы отправить в Telegram)
+$stmt = db()->prepare(
+  'SELECT id, table_id, booking_date, TIME_FORMAT(booking_time, "%H:%i") AS booking_time,
+          customer_name, customer_phone, people_count, comment
+   FROM bookings WHERE id = :id'
+);
+$stmt->execute([':id' => $id]);
+$b = $stmt->fetch();
+
+$del = db()->prepare('DELETE FROM bookings WHERE id = :id');
+$del->execute([':id' => $id]);
+$deleted = (int)$del->rowCount();
+
+if ($deleted > 0 && is_array($b)) {
+  // уведомление в Telegram (не ломает API, если Telegram недоступен)
+  tg_notify_booking('Бронь удалена', $b);
+}
+
+json_out(['ok' => true, 'deleted' => $deleted]);
+
+
+api\get_booking.php
+<?php
+declare(strict_types=1);
+
+require_once __DIR__ . '/db.php';
+require_once __DIR__ . '/auth.php';
+
+$body = require_json_body();
+require_admin_from_body($body);
+
+$id = (int)($body['id'] ?? 0);
+if ($id <= 0) json_out(['ok' => false, 'error' => 'Invalid id'], 400);
+
+$stmt = db()->prepare(
+  'SELECT id, table_id, booking_date, TIME_FORMAT(booking_time, "%H:%i") AS booking_time,
+          customer_name, customer_phone, people_count, comment
+   FROM bookings WHERE id = :id'
+);
+$stmt->execute([':id' => $id]);
+$row = $stmt->fetch();
+if (!$row) json_out(['ok' => false, 'error' => 'Not found'], 404);
+
+json_out(['ok' => true, 'booking' => $row]);
+
+
+api\get_bookings.php
+<?php
+declare(strict_types=1);
+
+require_once __DIR__ . '/db.php';
+require_once __DIR__ . '/auth.php';
+
+$body = require_json_body();
+require_admin_from_body($body);
+
+$date = (string)($body['date'] ?? '');
+$tableId = (int)($body['table_id'] ?? 0);
+
+if (!preg_match('/^\d{4}-\d{2}-\d{2}$/', $date)) json_out(['ok' => false, 'error' => 'Invalid date'], 400);
+if ($tableId < 1 || $tableId > 27) json_out(['ok' => false, 'error' => 'Invalid table_id'], 400);
+
+$stmt = db()->prepare(
+  'SELECT id, table_id, booking_date, TIME_FORMAT(booking_time, "%H:%i") AS booking_time,
+          customer_name, customer_phone, people_count, comment
+   FROM bookings
+   WHERE booking_date = :d AND table_id = :t
+   ORDER BY booking_time'
+);
+$stmt->execute([':d' => $date, ':t' => $tableId]);
+$bookings = $stmt->fetchAll();
+
+json_out(['ok' => true, 'bookings' => $bookings]);
+
+
+api\get_day_summary.php
+<?php
+declare(strict_types=1);
+
+require_once __DIR__ . '/db.php';
+require_once __DIR__ . '/auth.php';
+
+$body = require_json_body();
+require_admin_from_body($body);
+
+$date = (string)($body['date'] ?? '');
+if (!preg_match('/^\d{4}-\d{2}-\d{2}$/', $date)) {
+  json_out(['ok' => false, 'error' => 'Invalid date'], 400);
+}
+
+$counts = [];
+for ($i = 1; $i <= 27; $i++) $counts[(string)$i] = 0;
+
+$stmt = db()->prepare(
+  'SELECT table_id, COUNT(*) AS cnt
+   FROM bookings
+   WHERE booking_date = :d
+   GROUP BY table_id'
+);
+$stmt->execute([':d' => $date]);
+$rows = $stmt->fetchAll();
+
+foreach ($rows as $r) {
+  $tid = (int)$r['table_id'];
+  $cnt = (int)$r['cnt'];
+  if ($tid >= 1 && $tid <= 27) $counts[(string)$tid] = $cnt;
+}
+
+json_out(['ok' => true, 'counts' => $counts]);
+
+
+api\get_tables.php
+<?php
+declare(strict_types=1);
+
+require_once __DIR__ . '/db.php';
+require_once __DIR__ . '/auth.php';
+
+$body = require_json_body();
+require_admin_from_body($body);
+
+$rows = db()->query('SELECT id, label FROM restaurant_tables ORDER BY id')->fetchAll();
+json_out(['ok' => true, 'tables' => $rows]);
+
+
+api\telegram.php
+<?php
+declare(strict_types=1);
+
+require_once __DIR__ . '/config.php';
+
+/**
+ * digits only
+ */
+function tg_digits_only(string $s): string
+{
+  $d = preg_replace('/\D+/', '', $s);
+  return is_string($d) ? $d : '';
+}
+
+/**
+ * формат: 8 (029) 111-11-11  (11 цифр: 80291111111)
+ */
+function tg_format_phone(string $raw): string
+{
+  $d = tg_digits_only($raw);
+
+  if (strlen($d) === 11 && $d[0] === '8') {
+    $a = substr($d, 1, 3); // 029
+    $b = substr($d, 4, 3); // 111
+    $c = substr($d, 7, 2); // 11
+    $e = substr($d, 9, 2); // 11
+    return '8 (' . $a . ') ' . $b . '-' . $c . '-' . $e;
+  }
+
+  return $d !== '' ? $d : $raw;
+}
+
+/**
+ * Отправка сообщения в Telegram (в тему/тред).
+ * Ошибки НЕ должны ломать API — поэтому наружу не бросаем исключения.
+ */
+function tg_send_topic_message(string $text): bool
+{
+  if (!defined('TG_NOTIFY_ENABLED') || !TG_NOTIFY_ENABLED) return true;
+
+  $url = 'https://api.telegram.org/bot' . BOT_TOKEN . '/sendMessage';
+
+  $payload = [
+    'chat_id' => TG_NOTIFY_CHAT_ID,
+    'message_thread_id' => TG_NOTIFY_THREAD_ID,
+    'text' => $text,
+    'disable_web_page_preview' => true,
+  ];
+
+  try {
+    // curl предпочтительнее
+    if (function_exists('curl_init')) {
+      $ch = curl_init($url);
+      curl_setopt_array($ch, [
+        CURLOPT_POST => true,
+        CURLOPT_RETURNTRANSFER => true,
+        CURLOPT_POSTFIELDS => http_build_query($payload),
+        CURLOPT_CONNECTTIMEOUT => 3,
+        CURLOPT_TIMEOUT => 6,
+      ]);
+
+      $resp = curl_exec($ch);
+      $err  = curl_error($ch);
+      $code = (int)curl_getinfo($ch, CURLINFO_HTTP_CODE);
+      curl_close($ch);
+
+      if ($resp === false || $err) return false;
+      if ($code < 200 || $code >= 300) return false;
+
+      $data = json_decode((string)$resp, true);
+      return is_array($data) && !empty($data['ok']);
+    }
+
+    // fallback на file_get_contents
+    $opts = [
+      'http' => [
+        'method'  => 'POST',
+        'header'  => "Content-Type: application/x-www-form-urlencoded\r\n",
+        'content' => http_build_query($payload),
+        'timeout' => 6,
+      ],
+    ];
+    $ctx = stream_context_create($opts);
+    $resp = @file_get_contents($url, false, $ctx);
+    if ($resp === false) return false;
+
+    $data = json_decode((string)$resp, true);
+    return is_array($data) && !empty($data['ok']);
+  } catch (Throwable $e) {
+    return false;
+  }
+}
+
+/**
+ * Красивый текст для уведомления.
+ * $b ожидает ключи: id, table_id, booking_date, booking_time, customer_name, customer_phone, people_count, comment
+ */
+function tg_build_booking_text(string $title, array $b): string
+{
+  $id = isset($b['id']) ? (int)$b['id'] : 0;
+
+  $tableId = (string)($b['table_id'] ?? '—');
+  $date = (string)($b['booking_date'] ?? '—');
+  $time = (string)($b['booking_time'] ?? '—');
+  $name = (string)($b['customer_name'] ?? '—');
+
+  $phoneRaw = (string)($b['customer_phone'] ?? '—');
+  $phone = ($phoneRaw !== '—') ? tg_format_phone($phoneRaw) : '—';
+
+  $people = (string)($b['people_count'] ?? '—');
+  $comment = (string)($b['comment'] ?? '');
+  $comment = trim($comment) !== '' ? trim($comment) : '—';
+
+  $lines = [];
+  $lines[] = $title;
+  if ($id > 0) $lines[] = 'ID: ' . $id;
+  $lines[] = 'Стол: ' . $tableId;
+  $lines[] = 'Дата: ' . $date;
+  $lines[] = 'Время: ' . $time;
+  $lines[] = 'Имя: ' . $name;
+  $lines[] = 'Телефон: ' . $phone;
+  $lines[] = 'Гостей: ' . $people;
+  $lines[] = 'Комментарий: ' . $comment;
+
+  return implode("\n", $lines);
+}
+
+/**
+ * Уведомление по брони (не ломает API, если Telegram недоступен).
+ */
+function tg_notify_booking(string $title, array $booking): void
+{
+  $text = tg_build_booking_text($title, $booking);
+  tg_send_topic_message($text);
+}
+
+
+api\update_booking.php
+<?php
+declare(strict_types=1);
+
+require_once __DIR__ . '/db.php';
+require_once __DIR__ . '/auth.php';
+require_once __DIR__ . '/config.php';
+require_once __DIR__ . '/telegram.php';
+
+$body = require_json_body();
+require_admin_from_body($body);
+
+$id = (int)($body['id'] ?? 0);
+$time = (string)($body['time'] ?? ''); // "HH:MM"
+$name = trim((string)($body['name'] ?? ''));
+
+// телефон: принимаем и "8 (029) 111-11-11", и "80291111111" -> храним цифры
+$phoneRaw = (string)($body['phone'] ?? '');
+$phone = preg_replace('/\D+/', '', $phoneRaw);
+$phone = trim(is_string($phone) ? $phone : '');
+
+$people = (int)($body['people'] ?? 0);
+$comment = trim((string)($body['comment'] ?? ''));
+
+if ($id <= 0) json_out(['ok' => false, 'error' => 'Invalid id'], 400);
+if (!preg_match('/^\d{2}:\d{2}$/', $time)) json_out(['ok' => false, 'error' => 'Invalid time'], 400);
+if ($name === '') json_out(['ok' => false, 'error' => 'Name required'], 400);
+
+if ($phone === '') json_out(['ok' => false, 'error' => 'Phone required'], 400);
+// 11 цифр: 80XXXXXXXXX (пример: 80291111111 => 8 (029) 111-11-11)
+if (!preg_match('/^80\d{9}$/', $phone)) json_out(['ok' => false, 'error' => 'Invalid phone (example: 8 (029) 111-11-11)'], 400);
+
+if ($people < 1 || $people > 99) json_out(['ok' => false, 'error' => 'Invalid people_count'], 400);
+
+$stmt = db()->prepare('SELECT id, table_id, booking_date, booking_time FROM bookings WHERE id = :id');
+$stmt->execute([':id' => $id]);
+$cur = $stmt->fetch();
+if (!$cur) json_out(['ok' => false, 'error' => 'Not found'], 404);
+
+$date = (string)$cur['booking_date'];
+$tableId = (int)$cur['table_id'];
+
+// Запрет редактирования в прошлых датах (по Europe/Berlin)
+$today = (new DateTimeImmutable('now'))->format('Y-m-d');
+if ($date < $today) json_out(['ok' => false, 'error' => 'Past dates are not allowed'], 400);
+
+[$hh, $mm] = array_map('intval', explode(':', $time));
+if ($mm !== 0) json_out(['ok' => false, 'error' => 'Time must be on the hour'], 400);
+if ($hh < OPEN_HOUR || $hh >= CLOSE_HOUR) json_out(['ok' => false, 'error' => 'Time outside working hours'], 400);
+$timeSql = sprintf('%02d:00:00', $hh);
+
+try {
+  $upd = db()->prepare(
+    'UPDATE bookings
+     SET booking_time = :tm, customer_name = :n, customer_phone = :ph, people_count = :p, comment = :c
+     WHERE id = :id'
+  );
+  $upd->execute([
+    ':tm' => $timeSql,
+    ':n' => $name,
+    ':ph' => $phone,
+    ':p' => $people,
+    ':c' => ($comment === '' ? null : $comment),
+    ':id' => $id,
+  ]);
+} catch (PDOException $e) {
+  if (($e->getCode() ?? '') === '23000') {
+    json_out(['ok' => false, 'error' => 'This time is already booked'], 409);
+  }
+  json_out(['ok' => false, 'error' => 'DB error'], 500);
+}
+
+// уведомление в Telegram (не ломает API, если Telegram недоступен)
+tg_notify_booking('Бронь изменена', [
+  'id' => $id,
+  'table_id' => $tableId,
+  'booking_date' => $date,
+  'booking_time' => $time,
+  'customer_name' => $name,
+  'customer_phone' => $phone,
+  'people_count' => $people,
+  'comment' => ($comment === '' ? null : $comment),
+]);
+
+json_out(['ok' => true]);
+
+
+public\app.js
+(() => {
+  const tg = window.Telegram && window.Telegram.WebApp ? window.Telegram.WebApp : null;
+
+  // ВАЖНО: API относительно текущего адреса страницы
+  // Если страница: https://swyp.ru/other/cornflowers_reservation/public/
+  // то API будет:     https://swyp.ru/other/cornflowers_reservation/api/
+  const API_BASE = new URL('../api/', window.location.href);
+
+  // --- UI refs
+  const screenTitle = document.getElementById('screenTitle');
+  const screenSubtitle = document.getElementById('screenSubtitle');
+
+  const screen1 = document.getElementById('screen1');
+  const screen2 = document.getElementById('screen2');
+  const screen3 = document.getElementById('screen3');
+  const screen4 = document.getElementById('screen4');
+
+  const prevMonthBtn = document.getElementById('prevMonthBtn');
+  const nextMonthBtn = document.getElementById('nextMonthBtn');
+  const monthLabel = document.getElementById('monthLabel');
+  const calendarGrid = document.getElementById('calendarGrid');
+
+  const tablesRow1 = document.getElementById('tablesRow1');
+  const tablesRow2 = document.getElementById('tablesRow2');
+  const tablesRow3 = document.getElementById('tablesRow3');
+  const backToDateBtn = document.getElementById('backToDateBtn');
+
+  const bookingList = document.getElementById('bookingList');
+  const emptyHint = document.getElementById('emptyHint');
+  const backToTablesBtn = document.getElementById('backToTablesBtn');
+  const openCreateBtn = document.getElementById('openCreateBtn');
+
+  const createForm = document.getElementById('createForm');
+  const timeSelect = document.getElementById('timeSelect');
+  const nameInput = document.getElementById('nameInput');
+  const phoneInput = document.getElementById('phoneInput');
+  const peopleInput = document.getElementById('peopleInput');
+  const commentInput = document.getElementById('commentInput');
+  const cancelCreateBtn = document.getElementById('cancelCreateBtn');
+  const confirmCreateBtn = document.getElementById('confirmCreateBtn');
+
+  const modal = document.getElementById('modal');
+  const modalBackdrop = document.getElementById('modalBackdrop');
+  const modalKv = document.getElementById('modalKv');
+  const closeModalBtn = document.getElementById('closeModalBtn');
+  const editModalBtn = document.getElementById('editModalBtn');
+  const deleteModalBtn = document.getElementById('deleteModalBtn');
+
+  // --- state
+  let selectedDate = null;      // 'YYYY-MM-DD'
+  let selectedTableId = null;   // number
+  let visibleYear = null;
+  let visibleMonth = null;      // 0..11
+
+  let bookingsCache = [];       // list for current table+date
+  let tableCounts = {};         // { "1": 0, ... "27": 3 }
+
+  // Требование: бронь только с 9 до 21 (последний слот 21:00)
+  const openHour = 9;
+  const closeHour = 22; // exclusive
+
+  // create/edit mode
+  let editingBookingId = null;  // null => create, number => edit
+  let currentModalBooking = null;
+
+  // --- helpers
+  function pad2(n){ return String(n).padStart(2,'0'); }
+  function toISODate(d){
+    return `${d.getFullYear()}-${pad2(d.getMonth()+1)}-${pad2(d.getDate())}`;
+  }
+  function monthNameRu(m){
+    const names = ['Январь','Февраль','Март','Апрель','Май','Июнь','Июль','Август','Сентябрь','Октябрь','Ноябрь','Декабрь'];
+    return names[m] || '—';
+  }
+  function showScreen(n){
+    screen1.classList.toggle('hidden', n !== 1);
+    screen2.classList.toggle('hidden', n !== 2);
+    screen3.classList.toggle('hidden', n !== 3);
+    screen4.classList.toggle('hidden', n !== 4);
+  }
+  function setTitle(step, subtitle){
+    screenTitle.textContent = step;
+    screenSubtitle.textContent = subtitle || '';
+  }
+
+  async function api(endpointFile, payload){
+    const initData = tg ? (tg.initData || '') : '';
+    const url = new URL(endpointFile, API_BASE).toString();
+
+    const res = await fetch(url, {
+      method: 'POST',
+      headers: { 'Content-Type':'application/json' },
+      body: JSON.stringify({ initData, ...payload })
+    });
+
+    const text = await res.text();
+    let data = null;
+    try { data = JSON.parse(text); } catch (_) {}
+
+    if (!data || !data.ok){
+      const serverMsg = data && data.error ? data.error : null;
+      const raw = text ? text.slice(0, 300) : '';
+      const msg = serverMsg || `Ошибка API: ${res.status}${raw ? `: ${raw}` : ''}`;
+      throw new Error(msg);
+    }
+
+    return data;
+  }
+
+  // ---- Telegram capability helpers (ВАЖНО: telegram-web-app.js создает tg и в браузере)
+  function parseVersionStr(v){
+    const s = String(v || '');
+    const m = s.match(/^(\d+)(?:\.(\d+))?/);
+    if (!m) return [0,0];
+    const major = parseInt(m[1], 10) || 0;
+    const minor = parseInt(m[2] || '0', 10) || 0;
+    return [major, minor];
+  }
+
+  function tgVersionAtLeast(minStr){
+    const [needMajor, needMinor] = parseVersionStr(minStr);
+    const [curMajor, curMinor] = parseVersionStr(tg && tg.version ? tg.version : '');
+    if (curMajor !== needMajor) return curMajor > needMajor;
+    return curMinor >= needMinor;
+  }
+
+  function isRealTelegramEnv(){
+    // В обычном браузере tg обычно есть, но initData пустой.
+    try{
+      return !!(tg && typeof tg.initData === 'string' && tg.initData.length > 0);
+    }catch(_){
+      return false;
+    }
+  }
+
+  function canUseNativePopups(){
+    // showPopup/showAlert/showConfirm доступны с 6.2+
+    return isRealTelegramEnv() && tgVersionAtLeast('6.2');
+  }
+
+  function toast(msg){
+    const text = String(msg || '');
+
+    if (tg && canUseNativePopups()){
+      try{
+        if (typeof tg.showAlert === 'function'){
+          tg.showAlert(text);
+          return;
+        }
+        if (typeof tg.showPopup === 'function'){
+          tg.showPopup({ title: 'Сообщение', message: text, buttons: [{type:'ok'}] });
+          return;
+        }
+      }catch(_){
+        // fallthrough -> alert
+      }
+    }
+
+    alert(text);
+  }
+
+  async function confirmBox(msg){
+    const text = String(msg || '');
+
+    if (tg && canUseNativePopups()){
+      // Пытаемся нативно, но НИКОГДА не даем промису упасть наружу
+      try{
+        if (typeof tg.showPopup === 'function'){
+          return await new Promise((resolve) => {
+            try{
+              tg.showPopup({
+                title: 'Подтвердите',
+                message: text,
+                buttons: [
+                  { id: 'yes', type: 'default', text: 'Да' },
+                  { id: 'no', type: 'destructive', text: 'Нет' }
+                ]
+              }, (buttonId) => {
+                resolve(buttonId === 'yes');
+              });
+            }catch(_){
+              resolve(confirm(text));
+            }
+          });
+        }
+
+        if (typeof tg.showConfirm === 'function'){
+          return await new Promise((resolve) => {
+            try{
+              tg.showConfirm(text, (ok) => resolve(!!ok));
+            }catch(_){
+              resolve(confirm(text));
+            }
+          });
+        }
+      }catch(_){
+        // fallthrough -> confirm
+      }
+    }
+
+    return confirm(text);
+  }
+
+  function todayISO(){
+    // на фронте — по локальному времени устройства (бэк всё равно запрещает прошлое)
+    return toISODate(new Date());
+  }
+
+  function statusClassByCount(cnt){
+    // зелёный если броней нет. жёлтый 2-3. красный 4-5 (и выше тоже красный).
+    // 1 бронь оставляем зелёной.
+    if (cnt >= 4) return 'status-red';
+    if (cnt >= 2) return 'status-yellow';
+    return 'status-green';
+  }
+
+  function digitsOnly(s){
+    return String(s || '').replace(/\D/g, '');
+  }
+
+  function normalizePhoneInput(){
+    const v = digitsOnly(phoneInput.value);
+    if (phoneInput.value !== v) phoneInput.value = v;
+  }
+
+  // формат: 8 (029) 111-11-11  (11 цифр: 80291111111)
+  function formatPhoneForView(raw){
+    const d = digitsOnly(raw);
+
+    // 8 + (029) + 111 + 11 + 11 => 11 цифр
+    if (d.length === 11 && d[0] === '8'){
+      const a = d.slice(1, 4);   // 029
+      const b = d.slice(4, 7);   // 111
+      const c = d.slice(7, 9);   // 11
+      const e = d.slice(9, 11);  // 11
+      return `8 (${a}) ${b}-${c}-${e}`;
+    }
+
+    return d || '—';
+  }
+
+  // --- calendar render
+  function renderCalendar(year, month){
+    visibleYear = year;
+    visibleMonth = month;
+    monthLabel.textContent = `${monthNameRu(month)} ${year}`;
+    calendarGrid.innerHTML = '';
+
+    const first = new Date(year, month, 1);
+    const last = new Date(year, month + 1, 0);
+
+    // Monday-first index: 0..6
+    const jsDay = first.getDay(); // 0=Sun..6=Sat
+    const firstDow = (jsDay === 0) ? 6 : jsDay - 1;
+
+    const min = new Date();
+    const minYear = min.getFullYear();
+    const minMonth = min.getMonth();
+
+    prevMonthBtn.disabled = (year === minYear && month === minMonth);
+
+    // days from prev month (пустые)
+    for (let i=0; i<firstDow; i++){
+      const cell = document.createElement('div');
+      cell.className = 'day muted';
+      cell.textContent = '';
+      calendarGrid.appendChild(cell);
+    }
+
+    const today = todayISO();
+
+    for (let day=1; day<=last.getDate(); day++){
+      const d = new Date(year, month, day);
+      const iso = toISODate(d);
+
+      const cell = document.createElement('div');
+      cell.className = 'day';
+      cell.textContent = String(day);
+
+      const isPast = iso < today;
+      if (isPast){
+        cell.classList.add('disabled');
+      } else {
+        cell.addEventListener('click', async () => {
+          selectedDate = iso;
+
+          await loadDaySummary(); // чтобы столы сразу окрасились правильно
+
+          setTitle('Шаг 2 — Выбор стола', `Дата: ${selectedDate}`);
+          showScreen(2);
+          renderTables(); // перерисовать с цветами
+        });
+      }
+
+      if (selectedDate === iso) cell.classList.add('selected');
+      calendarGrid.appendChild(cell);
+    }
+  }
+
+  // --- day summary (counts per table)
+  async function loadDaySummary(){
+    tableCounts = {};
+    for (let i=1;i<=27;i++) tableCounts[String(i)] = 0;
+
+    try{
+      const data = await api('get_day_summary.php', { date: selectedDate });
+      tableCounts = data.counts || tableCounts;
+    }catch(e){
+      toast(e.message);
+    }
+  }
+
+  // --- tables render
+  function renderTables(){
+    function btn(tableId){
+      const b = document.createElement('button');
+      b.type = 'button';
+      b.className = 'table-btn';
+      b.textContent = String(tableId);
+
+      if (selectedTableId === tableId) b.classList.add('selected');
+
+      const cnt = selectedDate ? (parseInt(tableCounts[String(tableId)] || 0, 10) || 0) : 0;
+      if (selectedDate) b.classList.add(statusClassByCount(cnt));
+
+      b.addEventListener('click', async () => {
+        selectedTableId = tableId;
+        setTitle(`Шаг 3 — Стол ${selectedTableId}`, `Дата: ${selectedDate}`);
+        showScreen(3);
+        await loadBookingsAndRender();
+      });
+
+      return b;
+    }
+
+    tablesRow1.innerHTML = '';
+    tablesRow2.innerHTML = '';
+    tablesRow3.innerHTML = '';
+
+    for (let i=1;i<=10;i++) tablesRow1.appendChild(btn(i));
+    for (let i=11;i<=20;i++) tablesRow2.appendChild(btn(i));
+    for (let i=21;i<=27;i++) tablesRow3.appendChild(btn(i));
+  }
+
+  // --- bookings list
+  async function loadBookingsAndRender(){
+    bookingsCache = [];
+    bookingList.innerHTML = '';
+    emptyHint.classList.add('hidden');
+
+    try{
+      const data = await api('get_bookings.php', { date: selectedDate, table_id: selectedTableId });
+      bookingsCache = data.bookings || [];
+    }catch(e){
+      toast(e.message);
+      return;
+    }
+
+    if (!bookingsCache.length){
+      emptyHint.classList.remove('hidden');
+    } else {
+      for (const b of bookingsCache){
+        const row = document.createElement('div');
+        row.className = 'item';
+        row.tabIndex = 0;
+
+        const left = document.createElement('div');
+        left.className = 'left';
+
+        const main = document.createElement('div');
+        main.className = 'main';
+        main.textContent = `${b.booking_time} / ${b.customer_name} / ${b.people_count} чел.`;
+
+        const phoneLine = document.createElement('div');
+        phoneLine.className = 'sub phone';
+        phoneLine.textContent = formatPhoneForView(b.customer_phone);
+
+        const commentLine = document.createElement('div');
+        commentLine.className = 'sub comment';
+        commentLine.textContent = (b.comment && String(b.comment).trim()) ? String(b.comment).trim() : 'Без комментария';
+
+        left.appendChild(main);
+        left.appendChild(phoneLine);
+        left.appendChild(commentLine);
+
+        const arrow = document.createElement('div');
+        arrow.className = 'sub';
+        arrow.textContent = '›';
+
+        row.appendChild(left);
+        row.appendChild(arrow);
+
+        row.addEventListener('click', async () => {
+          await openBookingModal(b.id);
+        });
+
+        bookingList.appendChild(row);
+      }
+    }
+
+    // обновить окраску столов (counts) после загрузки/изменений
+    await loadDaySummary();
+    if (!screen2.classList.contains('hidden')) renderTables();
+  }
+
+  async function openBookingModal(id){
+    try{
+      const data = await api('get_booking.php', { id });
+      const b = data.booking;
+      currentModalBooking = b;
+
+      modalKv.innerHTML = '';
+      const pairs = [
+        ['Стол', String(b.table_id)],
+        ['Дата', String(b.booking_date)],
+        ['Время', String(b.booking_time)],
+        ['Имя', String(b.customer_name)],
+        ['Телефон', formatPhoneForView(b.customer_phone)],
+        ['Кол-во чел.', String(b.people_count)],
+        ['Комментарий', (b.comment && String(b.comment).trim()) ? String(b.comment).trim() : '—'],
+      ];
+
+      for (const [k,v] of pairs){
+        const kEl = document.createElement('div');
+        kEl.className = 'k';
+        kEl.textContent = k;
+
+        const vEl = document.createElement('div');
+        vEl.className = 'v';
+        vEl.textContent = v;
+
+        modalKv.appendChild(kEl);
+        modalKv.appendChild(vEl);
+      }
+
+      modal.classList.remove('hidden');
+    }catch(e){
+      toast(e.message);
+    }
+  }
+
+  function closeModal(){
+    modal.classList.add('hidden');
+    currentModalBooking = null;
+  }
+
+  // --- create/edit booking
+  function renderTimeSelect(allowTime /* "HH:MM" or null */){
+    timeSelect.innerHTML = '';
+
+    // занятые часы -> Set("HH:MM")
+    const taken = new Set(bookingsCache.map(b => b.booking_time));
+
+    for (let h=openHour; h<closeHour; h++){
+      const t = `${pad2(h)}:00`;
+      const opt = document.createElement('option');
+      opt.value = t;
+
+      const isTaken = taken.has(t);
+      const canUse = !isTaken || (allowTime && allowTime === t);
+
+      if (!canUse){
+        opt.disabled = true;
+        opt.textContent = `${t} (занято)`;
+      } else {
+        opt.textContent = t;
+      }
+
+      timeSelect.appendChild(opt);
+    }
+
+    // выставить значение
+    if (allowTime){
+      timeSelect.value = allowTime;
+    } else {
+      const firstEnabled = [...timeSelect.options].find(o => !o.disabled);
+      if (firstEnabled) timeSelect.value = firstEnabled.value;
+    }
+  }
+
+  async function submitBooking(){
+    const time = timeSelect.value;
+    const name = nameInput.value.trim();
+    normalizePhoneInput();
+    const phone = phoneInput.value.trim();
+    const people = parseInt(peopleInput.value, 10) || 0;
+    const comment = commentInput.value.trim();
+
+    if (!time){ toast('Выберите время'); return; }
+    if (!name){ toast('Введите имя'); return; }
+    if (!phone){ toast('Введите телефон'); return; }
+
+    // 11 цифр, начинается с 80 (пример: 8 (029) 111-11-11 => 80291111111)
+    if (!/^\d{11}$/.test(phone) || phone[0] !== '8' || phone[1] !== '0'){
+      toast('Телефон: 11 цифр, начинается с 80 (пример: 8 (029) 111-11-11)');
+      return;
+    }
+
+    if (people < 1){ toast('Укажите кол-во человек'); return; }
+
+    try{
+      if (editingBookingId){
+        await api('update_booking.php', {
+          id: editingBookingId,
+          time,
+          name,
+          phone,
+          people,
+          comment
+        });
+      } else {
+        await api('create_booking.php', {
+          date: selectedDate,
+          table_id: selectedTableId,
+          time,
+          name,
+          phone,
+          people,
+          comment
+        });
+      }
+
+      // назад к списку
+      editingBookingId = null;
+      confirmCreateBtn.textContent = 'Подтвердить';
+
+      setTitle(`Шаг 3 — Стол ${selectedTableId}`, `Дата: ${selectedDate}`);
+      showScreen(3);
+
+      // чистим форму
+      nameInput.value = '';
+      phoneInput.value = '';
+      peopleInput.value = '';
+      commentInput.value = '';
+
+      await loadBookingsAndRender();
+    }catch(e){
+      toast(e.message);
+    }
+  }
+
+  // --- events
+  prevMonthBtn.addEventListener('click', () => {
+    if (prevMonthBtn.disabled) return;
+    const d = new Date(visibleYear, visibleMonth, 1);
+    d.setMonth(d.getMonth() - 1);
+    renderCalendar(d.getFullYear(), d.getMonth());
+  });
+
+  nextMonthBtn.addEventListener('click', () => {
+    const d = new Date(visibleYear, visibleMonth, 1);
+    d.setMonth(d.getMonth() + 1);
+    renderCalendar(d.getFullYear(), d.getMonth());
+  });
+
+  backToDateBtn.addEventListener('click', () => {
+    setTitle('Шаг 1 — Выбор даты', '');
+    showScreen(1);
+  });
+
+  backToTablesBtn.addEventListener('click', () => {
+    setTitle('Шаг 2 — Выбор стола', `Дата: ${selectedDate}`);
+    showScreen(2);
+    renderTables();
+  });
+
+  openCreateBtn.addEventListener('click', async () => {
+    editingBookingId = null;
+    confirmCreateBtn.textContent = 'Подтвердить';
+
+    setTitle(`Шаг 4 — Бронь (Стол ${selectedTableId})`, `Дата: ${selectedDate}`);
+    showScreen(4);
+
+    renderTimeSelect(null);
+    nameInput.value = '';
+    phoneInput.value = '';
+    peopleInput.value = '';
+    commentInput.value = '';
+    nameInput.focus();
+  });
+
+  cancelCreateBtn.addEventListener('click', () => {
+    editingBookingId = null;
+    confirmCreateBtn.textContent = 'Подтвердить';
+
+    setTitle(`Шаг 3 — Стол ${selectedTableId}`, `Дата: ${selectedDate}`);
+    showScreen(3);
+  });
+
+  createForm.addEventListener('submit', (e) => {
+    e.preventDefault();
+    submitBooking();
+  });
+
+  modalBackdrop.addEventListener('click', closeModal);
+  closeModalBtn.addEventListener('click', closeModal);
+
+  editModalBtn.addEventListener('click', () => {
+    if (!currentModalBooking) return;
+
+    const b = currentModalBooking;
+
+    // открываем форму редактирования
+    editingBookingId = parseInt(b.id, 10);
+    confirmCreateBtn.textContent = 'Сохранить';
+
+    setTitle(`Шаг 4 — Редактирование (Стол ${b.table_id})`, `Дата: ${b.booking_date}`);
+    showScreen(4);
+
+    // текущие брони уже в bookingsCache (для выбранного стола/даты)
+    renderTimeSelect(String(b.booking_time));
+    nameInput.value = String(b.customer_name || '');
+    phoneInput.value = (b.customer_phone && String(b.customer_phone)) ? String(b.customer_phone) : '';
+    normalizePhoneInput();
+    peopleInput.value = String(b.people_count || '');
+    commentInput.value = (b.comment && String(b.comment)) ? String(b.comment) : '';
+    nameInput.focus();
+
+    closeModal();
+  });
+
+  deleteModalBtn.addEventListener('click', async () => {
+    if (!currentModalBooking) return;
+
+    const b = currentModalBooking;
+    const ok = await confirmBox(`Удалить бронь ${b.booking_date} ${b.booking_time} (стол ${b.table_id})?`);
+    if (!ok) return;
+
+    try{
+      await api('delete_booking.php', { id: parseInt(b.id, 10) });
+      closeModal();
+      await loadBookingsAndRender();
+    }catch(e){
+      toast(e.message);
+    }
+  });
+
+  // --- init
+  function init(){
+    // iPhone/iOS: добавляем класс на body (для padding-top: 80px)
+    const ua = navigator.userAgent || '';
+    const isIOS = /iPhone|iPad|iPod/i.test(ua) || (navigator.platform === 'MacIntel' && navigator.maxTouchPoints > 1);
+    if (isIOS) document.body.classList.add('ios');
+
+    if (tg){
+      tg.ready();
+      tg.expand();
+    }
+
+    const now = new Date();
+    visibleYear = now.getFullYear();
+    visibleMonth = now.getMonth();
+
+    setTitle('Шаг 1 — Выбор даты', '');
+    showScreen(1);
+
+    renderCalendar(visibleYear, visibleMonth);
+
+    // таблицы рисуем, но цвета появятся после выбора даты
+    renderTables();
+
+    // телефон — жестко только цифры
+    if (phoneInput){
+      phoneInput.addEventListener('input', normalizePhoneInput);
+      phoneInput.addEventListener('blur', normalizePhoneInput);
+    }
+  }
+
+  init();
+})();
+
+
+public\index.html
+<!doctype html>
+<html lang="ru">
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1, maximum-scale=1, user-scalable=no"/>
+  <title>Бронирование столов — Админ</title>
+  <link rel="stylesheet" href="./style.css" />
+</head>
+<body>
+  <div class="app">
+    <header class="topbar">
+      <div class="title" id="screenTitle">Шаг 1 — Выбор даты</div>
+      <div class="subtitle" id="screenSubtitle"></div>
+    </header>
+
+    <!-- Шаг 1: календарь -->
+    <section class="screen" id="screen1">
+      <div class="calendar">
+        <div class="calendar-head">
+          <button class="icon-btn" id="prevMonthBtn" aria-label="Предыдущий месяц">‹</button>
+          <div class="calendar-month" id="monthLabel">—</div>
+          <button class="icon-btn" id="nextMonthBtn" aria-label="Следующий месяц">›</button>
+        </div>
+        <div class="calendar-weekdays">
+          <div>Пн</div><div>Вт</div><div>Ср</div><div>Чт</div><div>Пт</div><div>Сб</div><div>Вс</div>
+        </div>
+        <div class="calendar-grid" id="calendarGrid"></div>
+        <div class="hint">Прошлые даты выбирать нельзя.</div>
+      </div>
+    </section>
+
+    <!-- Шаг 2: выбор стола -->
+    <section class="screen hidden" id="screen2">
+      <div class="tables">
+        <div class="hint">
+          Брони:
+          0–1 = зелёный, 2–3 = жёлтый, 4+ = красный
+        </div>
+
+        <div class="row-label">1–10</div>
+        <div class="table-row" id="tablesRow1"></div>
+
+        <div class="row-label">11–20</div>
+        <div class="table-row" id="tablesRow2"></div>
+
+        <div class="row-label">21–27</div>
+        <div class="table-row" id="tablesRow3"></div>
+      </div>
+
+      <div class="footer-actions">
+        <button class="btn secondary" id="backToDateBtn">← Назад</button>
+      </div>
+    </section>
+
+    <!-- Шаг 3: список броней -->
+    <section class="screen hidden" id="screen3">
+      <div class="bookings">
+        <div class="section-title">Существующие брони</div>
+        <div class="list" id="bookingList"></div>
+        <div class="hint" id="emptyHint">Пока нет броней на эту дату.</div>
+      </div>
+
+      <div class="footer-actions">
+        <button class="btn secondary" id="backToTablesBtn">← Назад</button>
+        <button class="btn primary" id="openCreateBtn">Забронировать</button>
+      </div>
+    </section>
+
+    <!-- Шаг 4: создание/редактирование -->
+    <section class="screen hidden" id="screen4">
+      <form class="form" id="createForm">
+        <label class="field">
+          <div class="label">Время (09:00–21:00)</div>
+          <select id="timeSelect" required></select>
+        </label>
+
+        <label class="field">
+          <div class="label">Имя</div>
+          <input id="nameInput" type="text" maxlength="120" required />
+        </label>
+
+        <label class="field">
+          <div class="label">Телефон</div>
+          <input id="phoneInput" type="tel" inputmode="numeric" autocomplete="tel" required />
+        </label>
+
+        <label class="field">
+          <div class="label">Кол-во чел.</div>
+          <input id="peopleInput" type="number" min="1" max="99" required />
+        </label>
+
+        <label class="field">
+          <div class="label">Комментарий</div>
+          <textarea id="commentInput" rows="3" maxlength="2000"></textarea>
+        </label>
+
+        <div class="footer-actions">
+          <button class="btn secondary" type="button" id="cancelCreateBtn">← Отмена</button>
+          <button class="btn primary" type="submit" id="confirmCreateBtn">Подтвердить</button>
+        </div>
+      </form>
+    </section>
+  </div>
+
+  <!-- Модалка просмотра брони -->
+  <div class="modal hidden" id="modal">
+    <div class="modal-backdrop" id="modalBackdrop"></div>
+    <div class="modal-card">
+      <div class="modal-title">Детали брони</div>
+      <div class="kv" id="modalKv"></div>
+      <div class="modal-actions modal-actions-3">
+        <button class="btn secondary" id="closeModalBtn">Закрыть</button>
+        <button class="btn primary" id="editModalBtn">Редактировать</button>
+        <button class="btn danger" id="deleteModalBtn">Удалить</button>
+      </div>
+    </div>
+  </div>
+
+  <script src="https://telegram.org/js/telegram-web-app.js"></script>
+  <script src="./app.js"></script>
+</body>
+</html>
+
+
+public\style.css
+:root{
+  --bg:#0f1115;
+  --card:#151923;
+  --muted:#9aa3b2;
+  --text:#e8ecf3;
+  --stroke:#263045;
+  --primary:#4e7cff;
+  --danger:#ff5d5d;
+
+  --green:#2bd576;
+  --yellow:#ffcc33;
+  --red:#ff4d4d;
+}
+
+*{ box-sizing:border-box; }
+html,body{ height:100%; }
+body{
+  margin:0;
+  font-family: system-ui, -apple-system, Segoe UI, Roboto, Arial, sans-serif;
+  background: var(--bg);
+  color: var(--text);
+}
+
+.app{
+  max-width: 720px;
+  margin: 0 auto;
+  padding: 12px 12px 22px;
+}
+
+.topbar{
+  padding: 10px 10px 12px;
+  border: 1px solid var(--stroke);
+  border-radius: 14px;
+  background: linear-gradient(180deg, rgba(255,255,255,0.03), rgba(255,255,255,0.01));
+  margin-bottom: 12px;
+}
+.title{
+  font-weight: 700;
+  font-size: 18px;
+}
+.subtitle{
+  margin-top: 4px;
+  color: var(--muted);
+  font-size: 13px;
+}
+
+.screen{ padding: 10px 0; }
+.hidden{ display:none; }
+
+.calendar{
+  border: 1px solid var(--stroke);
+  background: var(--card);
+  border-radius: 14px;
+  padding: 12px;
+}
+.calendar-head{
+  display:flex;
+  align-items:center;
+  justify-content:space-between;
+  margin-bottom: 10px;
+}
+.calendar-month{
+  font-weight: 700;
+}
+.icon-btn{
+  width: 40px;
+  height: 36px;
+  border-radius: 10px;
+  border: 1px solid var(--stroke);
+  background: transparent;
+  color: var(--text);
+  font-size: 18px;
+}
+.icon-btn:disabled{
+  opacity: 0.35;
+}
+.icon-btn:active{ transform: scale(0.98); }
+
+.calendar-weekdays{
+  display:grid;
+  grid-template-columns: repeat(7, 1fr);
+  gap: 6px;
+  color: var(--muted);
+  font-size: 12px;
+  padding: 0 4px;
+}
+.calendar-grid{
+  margin-top: 8px;
+  display:grid;
+  grid-template-columns: repeat(7, 1fr);
+  gap: 6px;
+}
+.day{
+  height: 44px;
+  border: 1px solid var(--stroke);
+  border-radius: 12px;
+  background: rgba(255,255,255,0.02);
+  color: var(--text);
+  display:flex;
+  align-items:center;
+  justify-content:center;
+  user-select:none;
+}
+.day.muted{
+  opacity: 0.35;
+}
+.day.disabled{
+  opacity: 0.25;
+}
+.day.selected{
+  border-color: rgba(78,124,255,0.9);
+  box-shadow: 0 0 0 2px rgba(78,124,255,0.25) inset;
+}
+.day:active{ transform: scale(0.98); }
+
+.tables{
+  border: 1px solid var(--stroke);
+  background: var(--card);
+  border-radius: 14px;
+  padding: 12px;
+}
+.row-label{
+  color: var(--muted);
+  font-size: 12px;
+  margin: 10px 2px 6px;
+}
+.table-row{
+  display:flex;
+  flex-wrap:wrap;
+  gap: 10px;
+}
+.table-btn{
+  width: 56px;
+  height: 56px;
+  border-radius: 999px;
+  border: 1px solid var(--stroke);
+  background: rgba(255,255,255,0.02);
+  color: var(--text);
+  font-weight: 700;
+  position: relative;
+}
+.table-btn.selected{
+  border-color: rgba(78,124,255,0.9);
+  box-shadow: 0 0 0 2px rgba(78,124,255,0.25) inset;
+}
+
+/* статусы столов */
+.table-btn.status-green{
+  border-color: rgba(43,213,118,0.9);
+  box-shadow: 0 0 0 2px rgba(43,213,118,0.18) inset;
+}
+.table-btn.status-yellow{
+  border-color: rgba(255,204,51,0.9);
+  box-shadow: 0 0 0 2px rgba(255,204,51,0.18) inset;
+}
+.table-btn.status-red{
+  border-color: rgba(255,77,77,0.9);
+  box-shadow: 0 0 0 2px rgba(255,77,77,0.18) inset;
+}
+
+.bookings{
+  border: 1px solid var(--stroke);
+  background: var(--card);
+  border-radius: 14px;
+  padding: 12px;
+}
+.section-title{
+  font-weight: 700;
+  margin-bottom: 8px;
+}
+.list{
+  display:flex;
+  flex-direction:column;
+  gap: 8px;
+}
+.item{
+  display:flex;
+  justify-content:space-between;
+  gap: 10px;
+  align-items:center;
+  padding: 10px 10px;
+  border: 1px solid var(--stroke);
+  border-radius: 12px;
+  background: rgba(255,255,255,0.02);
+}
+.item:active{ transform: scale(0.99); }
+.item .left{
+  display:flex;
+  flex-direction:column;
+  gap: 2px;
+}
+.item .main{
+  font-weight: 700;
+}
+.item .sub{
+  color: var(--muted);
+  font-size: 12px;
+}
+
+/* +2px именно для телефона и комментария в списке */
+.item .sub.phone,
+.item .sub.comment{
+  font-size: 14px;
+}
+
+.hint{
+  margin-top: 10px;
+  color: var(--muted);
+  font-size: 13px;
+  line-height: 1.35;
+}
+
+.form{
+  border: 1px solid var(--stroke);
+  background: var(--card);
+  border-radius: 14px;
+  padding: 12px;
+}
+.field{
+  display:block;
+  margin-bottom: 12px;
+}
+.label{
+  color: var(--muted);
+  font-size: 12px;
+  margin-bottom: 6px;
+}
+
+/* ВАЖНО: чтобы выпадающий список времени был читаемым в обычном браузере */
+input, select, textarea{
+  width: 100%;
+  border: 1px solid var(--stroke);
+  background: rgba(255,255,255,0.02);
+  color: var(--text);
+  border-radius: 12px;
+  padding: 10px 12px;
+  outline:none;
+  font-size: 15px;
+}
+select{
+  color-scheme: dark;
+}
+select option{
+  background: var(--card);
+  color: var(--text);
+}
+select:disabled, option:disabled{
+  color: rgba(232,236,243,0.35);
+}
+
+.footer-actions{
+  display:flex;
+  gap: 10px;
+  margin-top: 12px;
+  justify-content:space-between;
+}
+.btn{
+  flex:1;
+  padding: 12px 12px;
+  border-radius: 14px;
+  border: 1px solid var(--stroke);
+  font-weight: 800;
+  color: var(--text);
+  background: rgba(255,255,255,0.02);
+}
+.btn.primary{
+  background: rgba(78,124,255,0.9);
+  border-color: rgba(78,124,255,0.9);
+}
+.btn.secondary{
+  background: rgba(255,255,255,0.02);
+}
+.btn.danger{
+  background: rgba(255,93,93,0.9);
+  border-color: rgba(255,93,93,0.9);
+}
+.btn:active{ transform: scale(0.99); }
+
+.modal{
+  position: fixed;
+  inset: 0;
+  display:flex;
+  align-items:flex-end;
+  justify-content:center;
+  padding: 14px;
+}
+.modal.hidden{ display:none; }
+.modal-backdrop{
+  position:absolute;
+  inset:0;
+  background: rgba(0,0,0,0.5);
+}
+.modal-card{
+  position: relative;
+  width: 100%;
+  max-width: 720px;
+  border-radius: 16px;
+  background: var(--card);
+  border: 1px solid var(--stroke);
+  padding: 14px;
+  z-index: 1;
+}
+.modal-title{
+  font-weight: 800;
+  margin-bottom: 10px;
+}
+.kv{
+  display:grid;
+  grid-template-columns: 120px 1fr;
+  gap: 8px 10px;
+  color: var(--text);
+  font-size: 14px;
+}
+.kv .k{ color: var(--muted); }
+
+.modal-actions{ margin-top: 12px; }
+.modal-actions-3{
+  display:flex;
+  gap: 10px;
+}
+
+/* iPhone/iOS: отступ сверху 80px */
+body.ios .app{
+  padding-top: 100px;
+}
+
+

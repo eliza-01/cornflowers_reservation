@@ -1,0 +1,325 @@
+:root{
+  --bg:#0f1115;
+  --card:#151923;
+  --muted:#9aa3b2;
+  --text:#e8ecf3;
+  --stroke:#263045;
+  --primary:#4e7cff;
+  --danger:#ff5d5d;
+
+  --green:#2bd576;
+  --yellow:#ffcc33;
+  --red:#ff4d4d;
+}
+
+*{ box-sizing:border-box; }
+html,body{ height:100%; }
+body{
+  margin:0;
+  font-family: system-ui, -apple-system, Segoe UI, Roboto, Arial, sans-serif;
+  background: var(--bg);
+  color: var(--text);
+}
+
+.app{
+  max-width: 720px;
+  margin: 0 auto;
+  padding: 12px 12px 22px;
+}
+
+.topbar{
+  padding: 10px 10px 12px;
+  border: 1px solid var(--stroke);
+  border-radius: 14px;
+  background: linear-gradient(180deg, rgba(255,255,255,0.03), rgba(255,255,255,0.01));
+  margin-bottom: 12px;
+}
+.title{
+  font-weight: 700;
+  font-size: 18px;
+}
+.subtitle{
+  margin-top: 4px;
+  color: var(--muted);
+  font-size: 13px;
+}
+
+.screen{ padding: 10px 0; }
+.hidden{ display:none; }
+
+.calendar{
+  border: 1px solid var(--stroke);
+  background: var(--card);
+  border-radius: 14px;
+  padding: 12px;
+}
+.calendar-head{
+  display:flex;
+  align-items:center;
+  justify-content:space-between;
+  margin-bottom: 10px;
+}
+.calendar-month{
+  font-weight: 700;
+}
+.icon-btn{
+  width: 40px;
+  height: 36px;
+  border-radius: 10px;
+  border: 1px solid var(--stroke);
+  background: transparent;
+  color: var(--text);
+  font-size: 18px;
+}
+.icon-btn:disabled{
+  opacity: 0.35;
+}
+.icon-btn:active{ transform: scale(0.98); }
+
+.calendar-weekdays{
+  display:grid;
+  grid-template-columns: repeat(7, 1fr);
+  gap: 6px;
+  color: var(--muted);
+  font-size: 12px;
+  padding: 0 4px;
+}
+.calendar-grid{
+  margin-top: 8px;
+  display:grid;
+  grid-template-columns: repeat(7, 1fr);
+  gap: 6px;
+}
+.day{
+  height: 44px;
+  border: 1px solid var(--stroke);
+  border-radius: 12px;
+  background: rgba(255,255,255,0.02);
+  color: var(--text);
+  display:flex;
+  align-items:center;
+  justify-content:center;
+  user-select:none;
+}
+.day.muted{
+  opacity: 0.35;
+}
+.day.disabled{
+  opacity: 0.25;
+}
+.day.selected{
+  border-color: rgba(78,124,255,0.9);
+  box-shadow: 0 0 0 2px rgba(78,124,255,0.25) inset;
+}
+.day:active{ transform: scale(0.98); }
+
+.tables{
+  border: 1px solid var(--stroke);
+  background: var(--card);
+  border-radius: 14px;
+  padding: 12px;
+}
+.row-label{
+  color: var(--muted);
+  font-size: 12px;
+  margin: 10px 2px 6px;
+}
+.table-row{
+  display:flex;
+  flex-wrap:wrap;
+  gap: 10px;
+}
+.table-btn{
+  width: 56px;
+  height: 56px;
+  border-radius: 999px;
+  border: 1px solid var(--stroke);
+  background: rgba(255,255,255,0.02);
+  color: var(--text);
+  font-weight: 700;
+  position: relative;
+}
+.table-btn.selected{
+  border-color: rgba(78,124,255,0.9);
+  box-shadow: 0 0 0 2px rgba(78,124,255,0.25) inset;
+}
+
+/* статусы столов */
+.table-btn.status-green{
+  border-color: rgba(43,213,118,0.9);
+  box-shadow: 0 0 0 2px rgba(43,213,118,0.18) inset;
+}
+.table-btn.status-yellow{
+  border-color: rgba(255,204,51,0.9);
+  box-shadow: 0 0 0 2px rgba(255,204,51,0.18) inset;
+}
+.table-btn.status-red{
+  border-color: rgba(255,77,77,0.9);
+  box-shadow: 0 0 0 2px rgba(255,77,77,0.18) inset;
+}
+
+.bookings{
+  border: 1px solid var(--stroke);
+  background: var(--card);
+  border-radius: 14px;
+  padding: 12px;
+}
+.section-title{
+  font-weight: 700;
+  margin-bottom: 8px;
+}
+.list{
+  display:flex;
+  flex-direction:column;
+  gap: 8px;
+}
+.item{
+  display:flex;
+  justify-content:space-between;
+  gap: 10px;
+  align-items:center;
+  padding: 10px 10px;
+  border: 1px solid var(--stroke);
+  border-radius: 12px;
+  background: rgba(255,255,255,0.02);
+}
+.item:active{ transform: scale(0.99); }
+.item .left{
+  display:flex;
+  flex-direction:column;
+  gap: 2px;
+}
+.item .main{
+  font-weight: 700;
+}
+.item .sub{
+  color: var(--muted);
+  font-size: 12px;
+}
+
+/* +2px именно для телефона и комментария в списке */
+.item .sub.phone,
+.item .sub.comment{
+  font-size: 14px;
+}
+
+.hint{
+  margin-top: 10px;
+  color: var(--muted);
+  font-size: 13px;
+  line-height: 1.35;
+}
+
+.form{
+  border: 1px solid var(--stroke);
+  background: var(--card);
+  border-radius: 14px;
+  padding: 12px;
+}
+.field{
+  display:block;
+  margin-bottom: 12px;
+}
+.label{
+  color: var(--muted);
+  font-size: 12px;
+  margin-bottom: 6px;
+}
+
+/* ВАЖНО: чтобы выпадающий список времени был читаемым в обычном браузере */
+input, select, textarea{
+  width: 100%;
+  border: 1px solid var(--stroke);
+  background: rgba(255,255,255,0.02);
+  color: var(--text);
+  border-radius: 12px;
+  padding: 10px 12px;
+  outline:none;
+  font-size: 15px;
+}
+select{
+  color-scheme: dark;
+}
+select option{
+  background: var(--card);
+  color: var(--text);
+}
+select:disabled, option:disabled{
+  color: rgba(232,236,243,0.35);
+}
+
+.footer-actions{
+  display:flex;
+  gap: 10px;
+  margin-top: 12px;
+  justify-content:space-between;
+}
+.btn{
+  flex:1;
+  padding: 12px 12px;
+  border-radius: 14px;
+  border: 1px solid var(--stroke);
+  font-weight: 800;
+  color: var(--text);
+  background: rgba(255,255,255,0.02);
+}
+.btn.primary{
+  background: rgba(78,124,255,0.9);
+  border-color: rgba(78,124,255,0.9);
+}
+.btn.secondary{
+  background: rgba(255,255,255,0.02);
+}
+.btn.danger{
+  background: rgba(255,93,93,0.9);
+  border-color: rgba(255,93,93,0.9);
+}
+.btn:active{ transform: scale(0.99); }
+
+.modal{
+  position: fixed;
+  inset: 0;
+  display:flex;
+  align-items:flex-end;
+  justify-content:center;
+  padding: 14px;
+}
+.modal.hidden{ display:none; }
+.modal-backdrop{
+  position:absolute;
+  inset:0;
+  background: rgba(0,0,0,0.5);
+}
+.modal-card{
+  position: relative;
+  width: 100%;
+  max-width: 720px;
+  border-radius: 16px;
+  background: var(--card);
+  border: 1px solid var(--stroke);
+  padding: 14px;
+  z-index: 1;
+}
+.modal-title{
+  font-weight: 800;
+  margin-bottom: 10px;
+}
+.kv{
+  display:grid;
+  grid-template-columns: 120px 1fr;
+  gap: 8px 10px;
+  color: var(--text);
+  font-size: 14px;
+}
+.kv .k{ color: var(--muted); }
+
+.modal-actions{ margin-top: 12px; }
+.modal-actions-3{
+  display:flex;
+  gap: 10px;
+}
+
+/* iPhone/iOS: отступ сверху 80px */
+body.ios .app{
+  padding-top: 100px;
+}
